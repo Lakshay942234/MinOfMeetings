@@ -7,7 +7,7 @@ import asyncio
 from contextlib import asynccontextmanager
 
 from database import engine, Base
-from routers import auth, meetings, analytics, tasks, mom_edit
+from routers import auth, meetings, analytics, tasks, mom_edit, transcription
 from ms_graph_service import MSGraphService
 from transcript_scheduler import start_automatic_transcript_fetching, stop_automatic_transcript_fetching
 
@@ -68,6 +68,7 @@ app.include_router(meetings.router, prefix="/api/meetings", tags=["Meetings"])
 app.include_router(analytics.router, prefix="/api/analytics", tags=["Analytics"])
 app.include_router(tasks.router, prefix="/api/tasks", tags=["Tasks"])
 app.include_router(mom_edit.router, prefix="/api/mom", tags=["MOM Editing"])
+app.include_router(transcription.router, tags=["Transcription"])
 
 @app.get("/")
 async def root():

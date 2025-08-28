@@ -5,6 +5,7 @@ from typing import List, Dict, Optional
 from sqlalchemy.orm import Session
 from database import get_db, MeetingRaw, UserTokens
 from ms_graph_service import MSGraphService
+from whisper_service import whisper_service
 from routers.auth import async_get_valid_token
 import os
 from dotenv import load_dotenv
@@ -144,18 +145,26 @@ class TranscriptScheduler:
                         elif isinstance(p, str):
                             participant_emails.append(p)
                     
-                    # Try direct Teams transcript fetch
-                    transcript_text = None
-                    if participant_emails:
-                        transcript_text = await self.graph_service.fetch_teams_transcript_directly(
-                            access_token, meeting.title, start_time, end_time, participant_emails
-                        )
+                    # PRIMARY: Try Whisper transcription first (better for Hindi and other languages)
+                    transcript_text = await self.try_whisper_with_teams_recording(access_token, meeting, participant_emails)
                     
-                    # If direct fetch failed, try other methods
+                    # FALLBACK: If Whisper failed, try Teams transcript methods
                     if not transcript_text:
-                        transcript_text = await self.try_fallback_transcript_methods(
-                            access_token, meeting, participant_emails
-                        )
+                        use_teams_fallback = os.getenv("USE_TEAMS_TRANSCRIPT_FALLBACK", "false").lower() in ("1", "true", "yes")
+                        if use_teams_fallback:
+                            logger.info(f"Whisper failed, trying Teams transcript fallback for meeting {meeting.meeting_id}")
+                            if participant_emails:
+                                transcript_text = await self.graph_service.fetch_teams_transcript_directly(
+                                    access_token, meeting.title, start_time, end_time, participant_emails
+                                )
+                            
+                            # If direct fetch failed, try other Teams methods
+                            if not transcript_text:
+                                transcript_text = await self.try_fallback_transcript_methods(
+                                    access_token, meeting, participant_emails
+                                )
+                        else:
+                            logger.info("Teams transcript fallback disabled via USE_TEAMS_TRANSCRIPT_FALLBACK environment variable")
                     
                     # Update the meeting if we got a transcript
                     if transcript_text and len(transcript_text.strip()) > 50:  # Minimum meaningful transcript length
@@ -264,6 +273,138 @@ class TranscriptScheduler:
             
         except Exception as e:
             logger.error(f"Error in fallback transcript methods: {str(e)}")
+            return None
+    
+    async def try_whisper_with_teams_recording(self, access_token: str, meeting: MeetingRaw, participant_emails: List[str]) -> Optional[str]:
+        """Try to download Teams recording and transcribe using Whisper"""
+        try:
+            # Check if Whisper transcription is enabled
+            use_whisper_fallback = os.getenv("USE_WHISPER_FALLBACK", "false").lower() in ("1", "true", "yes")
+            if not use_whisper_fallback:
+                logger.info("Whisper fallback disabled via USE_WHISPER_FALLBACK environment variable")
+                return None
+            
+            logger.info(f"Attempting Teams recording download and Whisper transcription for meeting {meeting.meeting_id}")
+            
+            # Calculate meeting time range
+            start_time = meeting.date
+            end_time = start_time + timedelta(minutes=meeting.duration_minutes or 60)
+            
+            # Try to download Teams recording
+            recording_content = await self.graph_service.find_and_download_meeting_recording(
+                access_token, meeting.title or "Meeting", start_time, end_time, participant_emails
+            )
+            
+            if not recording_content:
+                logger.warning(f"No Teams recording found for meeting {meeting.meeting_id}")
+                # Fallback to local file search if enabled
+                return await self.try_whisper_local_file_fallback(meeting)
+            
+            logger.info(f"Downloaded Teams recording for meeting {meeting.meeting_id} ({len(recording_content)} bytes)")
+            
+            # Transcribe the downloaded recording using Whisper
+            result = await whisper_service.transcribe_audio_bytes(
+                recording_content, 
+                filename=f"{meeting.meeting_id}_recording.mp4"
+            )
+            
+            if result and result.get("text"):
+                transcript_text = result["text"].strip()
+                logger.info(f"Whisper transcription successful for meeting {meeting.meeting_id} ({len(transcript_text)} chars)")
+                
+                # Add metadata to indicate this was transcribed by Whisper from Teams recording
+                whisper_metadata = f"\n\n[Transcribed using OpenAI Whisper from Teams recording - Language: {result.get('language', 'auto-detected')}]"
+                return transcript_text + whisper_metadata
+            else:
+                logger.warning(f"Whisper transcription failed or returned empty text for meeting {meeting.meeting_id}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error in Teams recording download and Whisper transcription for meeting {meeting.meeting_id}: {str(e)}")
+            return None
+
+    async def try_whisper_local_file_fallback(self, meeting: MeetingRaw) -> Optional[str]:
+        """Fallback to local file transcription if Teams recording not available"""
+        try:
+            # Check if local file fallback is enabled
+            use_local_fallback = os.getenv("USE_LOCAL_FILE_FALLBACK", "true").lower() in ("1", "true", "yes")
+            if not use_local_fallback:
+                logger.info("Local file fallback disabled via USE_LOCAL_FILE_FALLBACK environment variable")
+                return None
+            
+            logger.info(f"Attempting local file fallback for meeting {meeting.meeting_id}")
+            
+            # Look for audio file associated with this meeting
+            audio_file_path = await self.find_meeting_audio_file(meeting)
+            if not audio_file_path:
+                logger.warning(f"No local audio file found for meeting {meeting.meeting_id}")
+                return None
+            
+            # Transcribe using Whisper
+            result = await whisper_service.transcribe_audio_file(audio_file_path)
+            if result and result.get("text"):
+                transcript_text = result["text"].strip()
+                logger.info(f"Local file Whisper transcription successful for meeting {meeting.meeting_id} ({len(transcript_text)} chars)")
+                
+                # Add metadata to indicate this was transcribed by Whisper from local file
+                whisper_metadata = f"\n\n[Transcribed using OpenAI Whisper from local file: {audio_file_path} - Language: {result.get('language', 'auto-detected')}]"
+                return transcript_text + whisper_metadata
+            else:
+                logger.warning(f"Local file Whisper transcription failed or returned empty text for meeting {meeting.meeting_id}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error in local file Whisper transcription for meeting {meeting.meeting_id}: {str(e)}")
+            return None
+    
+    async def find_meeting_audio_file(self, meeting: MeetingRaw) -> Optional[str]:
+        """Find audio file for a meeting in configured directories"""
+        try:
+            # Get audio file directories from environment
+            audio_dirs = os.getenv("MEETING_AUDIO_DIRECTORIES", "").split(",")
+            audio_dirs = [d.strip() for d in audio_dirs if d.strip()]
+            
+            if not audio_dirs:
+                logger.debug("No audio directories configured in MEETING_AUDIO_DIRECTORIES")
+                return None
+            
+            # Common audio file extensions
+            audio_extensions = [".wav", ".mp3", ".mp4", ".m4a", ".flac", ".ogg", ".wma", ".aac"]
+            
+            # Search patterns based on meeting info
+            search_patterns = [
+                meeting.meeting_id,
+                meeting.title.replace(" ", "_") if meeting.title else "",
+                f"{meeting.date.strftime('%Y%m%d_%H%M')}_{meeting.title.replace(' ', '_')}" if meeting.title else "",
+                meeting.date.strftime('%Y%m%d_%H%M')
+            ]
+            
+            # Remove empty patterns
+            search_patterns = [p for p in search_patterns if p]
+            
+            for audio_dir in audio_dirs:
+                if not os.path.exists(audio_dir):
+                    continue
+                    
+                for pattern in search_patterns:
+                    for ext in audio_extensions:
+                        # Try exact match
+                        audio_file = os.path.join(audio_dir, f"{pattern}{ext}")
+                        if os.path.exists(audio_file):
+                            logger.info(f"Found audio file: {audio_file}")
+                            return audio_file
+                        
+                        # Try case-insensitive search
+                        for file in os.listdir(audio_dir):
+                            if file.lower().startswith(pattern.lower()) and file.lower().endswith(ext):
+                                audio_file = os.path.join(audio_dir, file)
+                                logger.info(f"Found audio file (case-insensitive): {audio_file}")
+                                return audio_file
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding audio file for meeting {meeting.meeting_id}: {str(e)}")
             return None
 
 # Global scheduler instance

@@ -51,6 +51,9 @@ class MSGraphService:
             "Group.ReadWrite.All",
             "Mail.Send",
             "OnlineMeetingTranscript.Read.All",
+            "OnlineMeetingRecording.Read.All",
+            "Files.Read.All",
+            "Sites.Read.All",
         ]
 
         # Configurable HTTP timeouts to avoid hanging requests
@@ -1075,3 +1078,216 @@ class MSGraphService:
         except Exception as e:
             logger.error(f"Error sending email: {str(e)}")
             raise
+
+    async def list_online_meeting_recordings(self, access_token: str, online_meeting_id: str) -> List[Dict]:
+        """List recordings for an online meeting"""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        url = f"https://graph.microsoft.com/beta/me/onlineMeetings/{online_meeting_id}/recordings"
+        
+        try:
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                items: List[Dict] = []
+                page = 1
+                next_url = url
+                
+                while True:
+                    response = await client.get(next_url, headers=headers)
+                    if response.status_code == 404:
+                        if page == 1:
+                            logger.warning(f"No recordings found for onlineMeeting {online_meeting_id} (404)")
+                        break
+                    if response.status_code >= 400:
+                        logger.warning(f"list_online_meeting_recordings failed: status={response.status_code}")
+                        response.raise_for_status()
+                    
+                    data = response.json()
+                    batch = data.get("value", [])
+                    items.extend(batch)
+                    
+                    logger.info(f"list_online_meeting_recordings page {page}: fetched {len(batch)} item(s) (cumulative {len(items)})")
+                    
+                    next_link = data.get("@odata.nextLink")
+                    if not next_link:
+                        break
+                    next_url = next_link
+                    page += 1
+                
+                return items
+                
+        except httpx.HTTPError as e:
+            logger.warning(f"HTTP error listing recordings: {e}")
+            return []
+        except Exception as e:
+            logger.warning(f"Error listing recordings: {e}")
+            return []
+
+    async def download_meeting_recording(self, access_token: str, online_meeting_id: str, recording_id: str) -> Optional[bytes]:
+        """Download a meeting recording as bytes"""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+        }
+        url = f"https://graph.microsoft.com/beta/me/onlineMeetings/{online_meeting_id}/recordings/{recording_id}/content"
+        
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)) as client:
+                response = await client.get(url, headers=headers)
+                if response.status_code == 404:
+                    logger.warning(f"Recording content not found: {recording_id}")
+                    return None
+                response.raise_for_status()
+                
+                logger.info(f"Downloaded recording {recording_id} ({len(response.content)} bytes)")
+                return response.content
+                
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error downloading recording: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error downloading recording: {e}")
+            return None
+
+    async def search_onedrive_for_recording(self, access_token: str, meeting_title: str, start_time: datetime) -> Optional[bytes]:
+        """Search OneDrive directly for Teams recording files"""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        try:
+            # Search for video files in OneDrive that might be the recording
+            search_terms = [
+                meeting_title.replace(" ", "%20") if meeting_title else "",
+                start_time.strftime("%Y-%m-%d"),
+                "recording",
+                "Teams"
+            ]
+            
+            for search_term in search_terms:
+                if not search_term:
+                    continue
+                    
+                # Search OneDrive for files
+                url = f"https://graph.microsoft.com/v1.0/me/drive/root/search(q='{search_term}')"
+                
+                async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                    resp = await client.get(url, headers=headers)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        files = data.get("value", [])
+                        
+                        # Look for video files that might be recordings
+                        for file in files:
+                            name = file.get("name", "").lower()
+                            mime_type = file.get("file", {}).get("mimeType", "")
+                            
+                            if any(ext in name for ext in [".mp4", ".avi", ".mov", ".wmv"]) or "video" in mime_type:
+                                # Check if it's likely a Teams recording
+                                if any(keyword in name for keyword in ["recording", "teams", meeting_title.lower()]):
+                                    download_url = file.get("@microsoft.graph.downloadUrl")
+                                    if download_url:
+                                        logger.info(f"Found potential recording file: {file.get('name')}")
+                                        
+                                        # Download the file
+                                        download_resp = await client.get(download_url)
+                                        if download_resp.status_code == 200:
+                                            logger.info(f"Successfully downloaded recording from OneDrive: {len(download_resp.content)} bytes")
+                                            return download_resp.content
+                                        
+        except Exception as e:
+            logger.warning(f"OneDrive search failed: {e}")
+            
+        return None
+
+    async def find_and_download_meeting_recording(self, access_token: str, meeting_title: str, start_time: datetime, end_time: datetime, participants: List[str]) -> Optional[bytes]:
+        """Find and download the first available recording for a meeting"""
+        try:
+            online_meeting = None
+            
+            # NEW: First try to find the calendar event and use its joinUrl
+            try:
+                # Try to find the calendar event by searching recent events
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "application/json"
+                }
+                
+                # Search for events in the time range
+                start_iso = self._iso_utc(start_time)
+                end_iso = self._iso_utc(end_time)
+                
+                url = f"https://graph.microsoft.com/v1.0/me/calendarView?startDateTime={start_iso}&endDateTime={end_iso}&$select=id,subject,start,end,onlineMeeting,onlineMeetingUrl,isOnlineMeeting"
+                
+                async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                    resp = await client.get(url, headers=headers)
+                    resp.raise_for_status()
+                    events = resp.json().get("value", [])
+                    
+                    # Find matching event by title
+                    matching_event = None
+                    for event in events:
+                        if event.get("subject", "").strip().lower() == meeting_title.strip().lower():
+                            matching_event = event
+                            break
+                    
+                    if matching_event and matching_event.get("onlineMeeting"):
+                        join_url = matching_event["onlineMeeting"].get("joinUrl")
+                        if join_url:
+                            logger.info(f"Found joinUrl from calendar event: {join_url}")
+                            online_meeting = await self.find_online_meeting_by_join_url(access_token, join_url)
+                            if online_meeting:
+                                logger.info("Successfully found online meeting via calendar event joinUrl")
+            except Exception as e:
+                logger.warning(f"Calendar event search failed: {e}")
+            
+            # FALLBACK: Original search methods if calendar event approach failed
+            if not online_meeting:
+                logger.info("Trying fallback search methods...")
+                online_meeting = await self.find_online_meeting_by_time_and_participants(
+                    access_token, start_time, end_time, participants
+                )
+                
+                if not online_meeting:
+                    # Try alternative search methods
+                    online_meeting = await self.search_teams_meetings_directly(
+                        access_token, start_time, end_time, participants
+                    )
+            
+            if not online_meeting:
+                logger.warning("No online meeting found for recording download")
+                return None
+            
+            online_meeting_id = online_meeting.get("id")
+            if not online_meeting_id:
+                logger.warning("Online meeting found but no ID available")
+                return None
+            
+            # List recordings for this meeting
+            recordings = await self.list_online_meeting_recordings(access_token, online_meeting_id)
+            if not recordings:
+                logger.warning(f"No recordings found for meeting {online_meeting_id}")
+                return None
+            
+            # Get the latest recording (or first if no timestamp sorting available)
+            latest_recording = recordings[-1] if recordings else None
+            recording_id = latest_recording.get("id") if latest_recording else None
+            
+            if not recording_id:
+                logger.warning("Recording found but no ID available")
+                return None
+            
+            # Download the recording
+            recording_content = await self.download_meeting_recording(access_token, online_meeting_id, recording_id)
+            
+            if recording_content:
+                logger.info(f"Successfully downloaded recording for meeting: {meeting_title}")
+                return recording_content
+            else:
+                logger.warning(f"Failed to download recording content for meeting: {meeting_title}")
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error finding and downloading meeting recording: {e}")
+            return None
