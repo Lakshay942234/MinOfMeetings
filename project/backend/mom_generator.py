@@ -20,8 +20,8 @@ class MOMGenerator:
         self.settings = {
             "model": "km/maxai",
             "temperature": 0.1,
-            "presence_penalty": 1.5,
-            "frequency_penalty": 1.5,
+            "presence_penalty": 0.0,
+            "frequency_penalty": 0.0,
             "top_p": 0.8,
             "max_tokens": 8192,
             "extra_body": {
