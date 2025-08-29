@@ -19,7 +19,7 @@ Add these variables to your `.env` file:
 ```bash
 # Whisper model size (tiny, base, small, medium, large)
 # Larger models are more accurate but slower and require more memory
-WHISPER_MODEL=base
+WHISPER_MODEL=small
 
 # Device to use for Whisper (auto, cpu, cuda)
 # 'auto' will use CUDA if available, otherwise CPU
