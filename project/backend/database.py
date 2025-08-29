@@ -26,6 +26,9 @@ class MeetingRaw(Base):
     transcript_text = Column(Text)
     participants_json = Column(JSON)
     duration_minutes = Column(Integer)
+    transcription_status = Column(String, default="pending")  # pending, processing, completed, failed
+    transcription_method = Column(String, nullable=True)  # whisper, teams, local_file
+    mom_generated = Column(Boolean, default=False)  # Track if MOM has been generated
     created_at = Column(DateTime, default=func.now())
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 

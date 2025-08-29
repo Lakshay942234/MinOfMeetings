@@ -974,9 +974,196 @@ class MSGraphService:
             logger.error(f"Error getting transcript content: {str(e)}")
             raise
 
+    async def get_planner_buckets(self, access_token: str, plan_id: str) -> List[Dict]:
+        """Get all buckets in a Planner plan"""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        url = f"https://graph.microsoft.com/v1.0/planner/plans/{plan_id}/buckets"
+        
+        try:
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                response = await client.get(url, headers=headers)
+                response.raise_for_status()
+                
+                data = response.json()
+                buckets = data.get("value", [])
+                logger.info(f"Retrieved {len(buckets)} buckets from plan {plan_id}")
+                return buckets
+                
+        except httpx.HTTPError as e:
+            logger.error(f"HTTP error getting planner buckets: {str(e)}")
+            raise
+        except Exception as e:
+            logger.error(f"Error getting planner buckets: {str(e)}")
+            raise
+
+    async def find_bucket_by_name(self, access_token: str, plan_id: str, bucket_name: str) -> Optional[Dict]:
+        """Find a bucket by name in a Planner plan"""
+        try:
+            buckets = await self.get_planner_buckets(access_token, plan_id)
+            
+            for bucket in buckets:
+                if bucket.get("name", "").strip().lower() == bucket_name.strip().lower():
+                    logger.info(f"Found existing bucket: {bucket_name}")
+                    return bucket
+            
+            logger.info(f"Bucket '{bucket_name}' not found in plan {plan_id}")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error finding bucket by name: {str(e)}")
+            return None
+
+    async def create_planner_bucket(self, access_token: str, plan_id: str, bucket_name: str) -> Dict:
+        """Create a new bucket in a Planner plan"""
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        }
+        
+        payload = {
+            "name": bucket_name,
+            "planId": plan_id,
+            "orderHint": " !"
+        }
+        
+        url = "https://graph.microsoft.com/v1.0/planner/buckets"
+        
+        try:
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                if response.status_code >= 400:
+                    try:
+                        logger.error(
+                            f"Planner bucket create failed: status={response.status_code}, body={response.text}"
+                        )
+                    except Exception:
+                        pass
+                response.raise_for_status()
+                
+                bucket_data = response.json()
+                logger.info(f"Created Planner bucket: {bucket_name}")
+                return bucket_data
+                
+        except httpx.HTTPError as e:
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            text = getattr(getattr(e, 'response', None), 'text', None)
+            logger.error(f"HTTP error creating Planner bucket: {e}; status={status_code}, body={text}")
+            raise
+        except Exception as e:
+            logger.error(f"Error creating Planner bucket: {str(e)}")
+            raise
+
+    async def get_or_create_meeting_bucket(self, access_token: str, plan_id: str, meeting_title: str) -> Optional[str]:
+        """Get existing bucket or create new one for a meeting. Returns bucket_id."""
+        try:
+            # Clean meeting title for bucket name (remove special chars, limit length)
+            bucket_name = self._sanitize_bucket_name(meeting_title)
+            
+            # Check if bucket already exists
+            existing_bucket = await self.find_bucket_by_name(access_token, plan_id, bucket_name)
+            if existing_bucket:
+                return existing_bucket.get("id")
+            
+            # Create new bucket
+            new_bucket = await self.create_planner_bucket(access_token, plan_id, bucket_name)
+            return new_bucket.get("id")
+            
+        except Exception as e:
+            logger.error(f"Error getting/creating meeting bucket: {str(e)}")
+            return None
+
+    def _sanitize_bucket_name(self, meeting_title: str) -> str:
+        """Sanitize meeting title for use as bucket name"""
+        import re
+        # Remove special characters and limit length
+        sanitized = re.sub(r'[^\w\s-]', '', meeting_title.strip())
+        # Replace multiple spaces/hyphens with single space
+        sanitized = re.sub(r'[\s-]+', ' ', sanitized)
+        # Limit to 255 characters (Planner bucket name limit)
+        return sanitized[:255].strip()
+
+    async def add_plan_member(self, access_token: str, plan_id: str, user_id: str) -> bool:
+        """Add a user as a member to a Microsoft Planner plan using Group membership"""
+        try:
+            # First, get the plan to find its associated group
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # Get plan details to find the group ID
+            url = f"https://graph.microsoft.com/v1.0/planner/plans/{plan_id}"
+            async with httpx.AsyncClient(timeout=self.http_timeout) as client:
+                response = await client.get(url, headers=headers)
+                if response.status_code != 200:
+                    logger.error(f"Failed to get plan info: {response.status_code} - {response.text}")
+                    return False
+                
+                plan_info = response.json()
+                group_id = plan_info.get("container", {}).get("containerId")
+                
+                if not group_id:
+                    logger.error(f"No group ID found for plan {plan_id}")
+                    return False
+                
+                logger.info(f"Found group ID {group_id} for plan {plan_id}")
+                
+                # Check if user is already a member of the group
+                check_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/members/{user_id}"
+                response = await client.get(check_url, headers=headers)
+                
+                if response.status_code == 200:
+                    logger.info(f"User {user_id} is already a member of group {group_id}")
+                    return True
+                elif response.status_code == 404:
+                    logger.info(f"User {user_id} is not a member, adding to group {group_id}")
+                else:
+                    logger.warning(f"Unexpected response checking membership: {response.status_code}")
+                
+                # Add user to the group (which gives them access to the plan)
+                add_url = f"https://graph.microsoft.com/v1.0/groups/{group_id}/members/$ref"
+                payload = {
+                    "@odata.id": f"https://graph.microsoft.com/v1.0/users/{user_id}"
+                }
+                
+                response = await client.post(add_url, headers=headers, json=payload)
+                
+                if response.status_code == 204:
+                    logger.info(f"Successfully added user {user_id} to group {group_id}")
+                    return True
+                elif response.status_code == 400:
+                    # User might already be a member or invalid user ID
+                    error_text = response.text
+                    if "already exists" in error_text.lower():
+                        logger.info(f"User {user_id} already exists in group {group_id}")
+                        return True
+                    else:
+                        logger.error(f"Bad request adding user to group: {error_text}")
+                        return False
+                else:
+                    logger.error(f"Failed to add user to group: {response.status_code} - {response.text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error adding user {user_id} to plan {plan_id}: {str(e)}")
+            return False
+    
     async def create_planner_task(self, access_token: str, plan_id: str, bucket_id: str, 
-                                task_title: str, assigned_user_id: str, due_date: Optional[datetime] = None) -> Dict:
+                                task_title: str, assigned_user_id: str, due_date: Optional[datetime] = None, 
+                                auto_add_member: bool = True) -> Dict:
         """Create task in Microsoft Planner"""
+        # Optionally ensure the user is a member of the plan
+        if auto_add_member:
+            member_added = await self.add_plan_member(access_token, plan_id, assigned_user_id)
+            if not member_added:
+                logger.warning(f"Could not add user {assigned_user_id} to plan {plan_id}, proceeding anyway")
+        else:
+            logger.info(f"Skipping automatic member addition for user {assigned_user_id}")
+        
         headers = {
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json"

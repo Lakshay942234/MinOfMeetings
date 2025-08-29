@@ -7,6 +7,7 @@ from schemas.mom_schemas import (
     ActionItemCreate, ActionItemUpdate, ActionItemResponse
 )
 import logging
+import traceback
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -38,6 +39,34 @@ async def update_mom(
     
     # Update only provided fields
     update_data = mom_update.dict(exclude_unset=True)
+    logger.debug(f"Raw MOM update payload for {meeting_id}: {update_data}")
+
+    # Normalize list fields to a consistent [{"text": str}] shape
+    def _normalize_points(value):
+        if value is None:
+            return None
+        if isinstance(value, list):
+            normalized = []
+            for item in value:
+                if isinstance(item, dict):
+                    text = item.get("text") or item.get("content") or ""
+                    normalized.append({"text": text})
+                elif isinstance(item, str):
+                    normalized.append({"text": item})
+                else:
+                    normalized.append({"text": str(item)})
+            return normalized
+        return value
+
+    for fld in ["agenda", "key_decisions", "follow_up_points"]:
+        if fld in update_data:
+            update_data[fld] = _normalize_points(update_data.get(fld))
+
+    # Action items for display may come from TaskItem table; avoid overwriting JSON unless explicitly desired
+    if "action_items" in update_data:
+        logger.warning("Ignoring 'action_items' in MOM update; action items are managed via dedicated endpoints")
+        update_data.pop("action_items", None)
+
     for field, value in update_data.items():
         setattr(mom, field, value)
     
@@ -49,6 +78,7 @@ async def update_mom(
     except Exception as e:
         db.rollback()
         logger.error(f"Error updating MOM for meeting {meeting_id}: {str(e)}")
+        logger.error(f"Traceback: {traceback.format_exc()}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to update MOM"

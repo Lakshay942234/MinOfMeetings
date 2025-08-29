@@ -3,10 +3,12 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Optional
 from sqlalchemy.orm import Session
-from database import get_db, MeetingRaw, UserTokens
+from database import get_db, MeetingRaw, UserTokens, MOMStructured
 from ms_graph_service import MSGraphService
 from whisper_service import whisper_service
 from routers.auth import async_get_valid_token
+from mom_generator import MOMGenerator
+from task_assigner import TaskAssigner
 import os
 from dotenv import load_dotenv
 
@@ -80,7 +82,7 @@ class TranscriptScheduler:
             
             meetings_without_transcripts = db.query(MeetingRaw).filter(
                 MeetingRaw.date >= cutoff_time.replace(tzinfo=None),
-                MeetingRaw.transcript_text.in_(["Transcript not available", "", None])
+                MeetingRaw.transcription_status.in_(["pending", "failed"])
             ).all()
             
             logger.info(f"Found {len(meetings_without_transcripts)} meetings without transcripts")
@@ -130,6 +132,10 @@ class TranscriptScheduler:
                 async def process_one_meeting() -> int:
                     logger.info(f"Attempting to fetch transcript for meeting {meeting.meeting_id}")
                     
+                    # Mark as processing
+                    meeting.transcription_status = "processing"
+                    db.commit()
+                    
                     # Extract meeting details
                     participants = meeting.participants_json or []
                     start_time = meeting.date
@@ -169,12 +175,31 @@ class TranscriptScheduler:
                     # Update the meeting if we got a transcript
                     if transcript_text and len(transcript_text.strip()) > 50:  # Minimum meaningful transcript length
                         meeting.transcript_text = transcript_text
+                        meeting.transcription_status = "completed"
+                        
+                        # Determine transcription method
+                        if "[Transcribed using OpenAI Whisper" in transcript_text:
+                            if "from Teams recording" in transcript_text:
+                                meeting.transcription_method = "whisper_teams"
+                            elif "from local file" in transcript_text:
+                                meeting.transcription_method = "whisper_local"
+                            else:
+                                meeting.transcription_method = "whisper"
+                        else:
+                            meeting.transcription_method = "teams"
+                        
                         db.commit()
                         logger.info(
-                            f"Successfully updated transcript for meeting {meeting.meeting_id} ({len(transcript_text)} chars)"
+                            f"Successfully updated transcript for meeting {meeting.meeting_id} ({len(transcript_text)} chars) via {meeting.transcription_method}"
                         )
+                        
+                        # Trigger MOM generation asynchronously
+                        await self.trigger_mom_generation(db, meeting, access_token)
+                        
                         return 1
                     else:
+                        meeting.transcription_status = "failed"
+                        db.commit()
                         logger.warning(f"No transcript found for meeting {meeting.meeting_id}")
                         return 0
 
@@ -406,6 +431,68 @@ class TranscriptScheduler:
         except Exception as e:
             logger.error(f"Error finding audio file for meeting {meeting.meeting_id}: {str(e)}")
             return None
+    
+    async def trigger_mom_generation(self, db: Session, meeting: MeetingRaw, access_token: str):
+        """Trigger MOM generation after successful transcription"""
+        try:
+            # Check if MOM already exists for this meeting
+            existing_mom = db.query(MOMStructured).filter(
+                MOMStructured.meeting_id == meeting.meeting_id
+            ).first()
+            
+            if existing_mom:
+                logger.info(f"MOM already exists for meeting {meeting.meeting_id}, skipping generation")
+                meeting.mom_generated = True
+                db.commit()
+                return
+            
+            logger.info(f"Generating MOM for meeting {meeting.meeting_id}")
+            
+            # Initialize MOM generator
+            mom_generator = MOMGenerator()
+            
+            # Generate MOM using MaxAI
+            mom_data = await mom_generator.generate_mom(
+                transcript_text=meeting.transcript_text,
+                participants=meeting.participants_json or [],
+                meeting_title=meeting.title or "Meeting",
+                meeting_date=meeting.date
+            )
+            
+            # Save MOM to database
+            mom_record = MOMStructured(
+                meeting_id=meeting.meeting_id,
+                meeting_title=mom_data.get("meeting_title", meeting.title),
+                date=meeting.date,
+                agenda=mom_data.get("agenda", []),
+                key_decisions=mom_data.get("key_decisions", []),
+                action_items=mom_data.get("action_items", []),
+                follow_up_points=mom_data.get("follow_up_points", [])
+            )
+            
+            db.add(mom_record)
+            meeting.mom_generated = True
+            db.commit()
+            
+            logger.info(f"MOM generated and saved for meeting {meeting.meeting_id}")
+            
+            # Assign tasks if there are action items
+            action_items = mom_data.get("action_items", [])
+            if action_items:
+                try:
+                    task_assigner = TaskAssigner()
+                    assigned_tasks = await task_assigner.assign_tasks(
+                        access_token=access_token,
+                        action_items=action_items,
+                        meeting_title=meeting.title or "Meeting"
+                    )
+                    logger.info(f"Assigned {len(assigned_tasks)} tasks for meeting {meeting.meeting_id}")
+                except Exception as e:
+                    logger.error(f"Error assigning tasks for meeting {meeting.meeting_id}: {str(e)}")
+            
+        except Exception as e:
+            logger.error(f"Error generating MOM for meeting {meeting.meeting_id}: {str(e)}")
+            # Don't mark as failed, allow manual retry
 
 # Global scheduler instance
 transcript_scheduler = TranscriptScheduler()

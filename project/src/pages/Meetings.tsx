@@ -14,6 +14,10 @@ interface Meeting {
   participants_count: number;
   has_mom: boolean;
   has_transcript: boolean;
+  transcript_text?: string;
+  transcription_status?: string;
+  transcription_method?: string;
+  mom_generated?: boolean;
 }
 
 interface ActionItem {
@@ -27,12 +31,15 @@ interface ActionItem {
 }
 
 interface MOM {
+  id?: number;
+  meeting_id: string;
   meeting_title: string;
   date: string;
-  agenda: string[];
-  key_decisions: string[];
+  agenda: Array<{ text: string } | string>;
+  key_decisions: Array<{ text: string } | string>;
   action_items: ActionItem[];
-  follow_up_points: string[];
+  follow_up_points: Array<{ text: string } | string>;
+  created_at?: string;
 }
 
 const Meetings: React.FC = () => {
@@ -122,11 +129,23 @@ const Meetings: React.FC = () => {
     });
   };
 
+  // Ensure backend-friendly datetime string or null
+  const toBackendDateTime = (dateStr?: string | null) => {
+    if (!dateStr) return null;
+    if (dateStr.includes('T')) return dateStr;
+    // Expecting YYYY-MM-DD from <input type="date">
+    return `${dateStr}T00:00:00`;
+  };
+
   // API functions for editing MOM and action items
   const updateMOM = async (meetingId: string, updates: Partial<MOM>) => {
     try {
+      console.log('Updating MOM for meeting:', meetingId, 'with updates:', updates);
       const response = await api.put(`/mom/mom/${meetingId}`, updates);
-      setMom(response);
+      console.log('MOM update response:', response);
+      if (mom) {
+        setMom({ ...mom, ...updates });
+      }
       setError(null);
     } catch (error) {
       console.error('Error updating MOM:', error);
@@ -136,7 +155,10 @@ const Meetings: React.FC = () => {
 
   const addActionItem = async (meetingId: string, item: Omit<ActionItem, 'id'>) => {
     try {
-      const response = await api.post(`/mom/action-items/${meetingId}`, item);
+      console.log('Adding action item for meeting:', meetingId, 'item:', item);
+      const payload = { ...item, due_date: toBackendDateTime(item.due_date || undefined) };
+      const response = await api.post(`/mom/action-items/${meetingId}`, payload);
+      console.log('Add action item response:', response);
       if (mom) {
         setMom({
           ...mom,
@@ -151,14 +173,37 @@ const Meetings: React.FC = () => {
   };
 
   const updateActionItems = async (items: ActionItem[]) => {
-    // This would update multiple items - for now we'll handle individual updates
-    if (mom) {
-      setMom({ ...mom, action_items: items });
+    try {
+      console.log('Updating action items:', items);
+      // Update each item individually via API
+      for (const item of items) {
+        if (item.id) {
+          console.log('Updating action item:', item.id, item);
+          await api.put(`/mom/action-items/${item.id}`, {
+            task: item.task,
+            assigned_to: item.assigned_to,
+            due_date: toBackendDateTime(item.due_date || undefined),
+            priority: item.priority,
+            status: item.status,
+            description: item.description
+          });
+        }
+      }
+      // Update local state
+      if (mom) {
+        setMom({ ...mom, action_items: items });
+      }
+      setError(null);
+      console.log('Action items updated successfully');
+    } catch (error) {
+      console.error('Error updating action items:', error);
+      setError(`Failed to update action items: ${error}`);
     }
   };
 
   const deleteActionItem = async (id: string) => {
     try {
+      console.log('Deleting action item:', id);
       await api.delete(`/mom/action-items/${id}`);
       if (mom) {
         setMom({
@@ -167,6 +212,7 @@ const Meetings: React.FC = () => {
         });
       }
       setError(null);
+      console.log('Action item deleted successfully');
     } catch (error) {
       console.error('Error deleting action item:', error);
       setError(`Failed to delete action item: ${error}`);
@@ -175,7 +221,7 @@ const Meetings: React.FC = () => {
 
   const updateActionItemStatus = async (id: string, status: ActionItem['status']) => {
     try {
-      await api.put(`/mom/action-items/${id}/status`, { status });
+      await api.put(`/mom/action-items/${id}/status?status=${encodeURIComponent(status)}`);
       if (mom) {
         setMom({
           ...mom,
@@ -309,11 +355,26 @@ ${mom.follow_up_points.map(item => `- ${item}`).join('\n')}
                       </div>
                       
                       <div className="flex items-center space-x-2 ml-4">
-                        {meeting.has_mom ? (
-                          <span className="status-success">MOM Ready</span>
-                        ) : (
-                          <span className="status-warning">Pending</span>
-                        )}
+                        {(() => {
+                          const meetingDate = new Date(meeting.date);
+                          const now = new Date();
+                          const hasTranscript = meeting.has_transcript || (meeting.transcript_text && meeting.transcript_text.length > 100);
+                          const hasMOM = meeting.has_mom || meeting.mom_generated;
+                          
+                          // Meeting hasn't happened yet
+                          if (meetingDate > now) {
+                            return <span className="status-secondary">Scheduled</span>;
+                          }
+                          
+                          // Meeting happened, check status
+                          if (hasMOM) {
+                            return <span className="status-success">MOM Generated</span>;
+                          } else if (hasTranscript) {
+                            return <span className="status-info">Generate MOM</span>;
+                          } else {
+                            return <span className="status-warning">Waiting</span>;
+                          }
+                        })()} 
                       </div>
                     </div>
                   </div>
@@ -488,24 +549,24 @@ ${mom.follow_up_points.map(item => `- ${item}`).join('\n')}
                     {/* Editable Agenda */}
                     <EditableList
                       title="Agenda"
-                      items={mom.agenda}
-                      onUpdate={(items) => selectedMeeting && updateMOM(selectedMeeting.meeting_id, { agenda: items })}
+                      items={mom.agenda?.map(item => typeof item === 'string' ? item : (item as any)?.text || (item as any)?.content || '') || []}
+                      onUpdate={(items) => selectedMeeting && updateMOM(selectedMeeting.meeting_id, { agenda: items.map(item => ({ text: item })) })}
                       placeholder="Add agenda item..."
                     />
                     
                     {/* Editable Key Decisions */}
                     <EditableList
                       title="Key Decisions"
-                      items={mom.key_decisions}
-                      onUpdate={(items) => selectedMeeting && updateMOM(selectedMeeting.meeting_id, { key_decisions: items })}
+                      items={mom.key_decisions?.map(item => typeof item === 'string' ? item : (item as any)?.text || (item as any)?.content || '') || []}
+                      onUpdate={(items) => selectedMeeting && updateMOM(selectedMeeting.meeting_id, { key_decisions: items.map(item => ({ text: item })) })}
                       placeholder="Add decision..."
                     />
                     
                     {/* Editable Follow-up Points */}
                     <EditableList
                       title="Follow-up Points"
-                      items={mom.follow_up_points}
-                      onUpdate={(items) => selectedMeeting && updateMOM(selectedMeeting.meeting_id, { follow_up_points: items })}
+                      items={mom.follow_up_points?.map(item => typeof item === 'string' ? item : (item as any)?.text || (item as any)?.content || '') || []}
+                      onUpdate={(items) => selectedMeeting && updateMOM(selectedMeeting.meeting_id, { follow_up_points: items.map(item => ({ text: item })) })}
                       placeholder="Add follow-up point..."
                     />
                     

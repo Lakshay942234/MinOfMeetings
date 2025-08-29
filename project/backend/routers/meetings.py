@@ -296,13 +296,33 @@ async def sync_meetings(
             
             # Store raw meeting data
             try:
+                # Determine initial transcription status
+                if transcript_text and transcript_text != "Transcript not available" and len(transcript_text.strip()) > 50:
+                    transcription_status = "completed"
+                    # Determine method from transcript content
+                    if "[Transcribed using OpenAI Whisper" in transcript_text:
+                        if "from Teams recording" in transcript_text:
+                            transcription_method = "whisper_teams"
+                        elif "from local file" in transcript_text:
+                            transcription_method = "whisper_local"
+                        else:
+                            transcription_method = "whisper"
+                    else:
+                        transcription_method = "teams"
+                else:
+                    transcription_status = "pending"
+                    transcription_method = None
+                
                 meeting_raw = MeetingRaw(
                     meeting_id=meeting_id,
                     title=title,
                     date=start_time,
                     transcript_text=transcript_text,
                     participants_json=participants,
-                    duration_minutes=duration_minutes
+                    duration_minutes=duration_minutes,
+                    transcription_status=transcription_status,
+                    transcription_method=transcription_method,
+                    mom_generated=False
                 )
                 
                 db.add(meeting_raw)
@@ -453,7 +473,10 @@ async def get_meetings(
             "duration_minutes": meeting.duration_minutes,
             "participants_count": len(meeting.participants_json or []),
             "has_mom": mom_exists,
-            "has_transcript": len(meeting.transcript_text or "") > 100
+            "has_transcript": len(meeting.transcript_text or "") > 100,
+            "transcription_status": getattr(meeting, 'transcription_status', 'pending'),
+            "transcription_method": getattr(meeting, 'transcription_method', None),
+            "mom_generated": getattr(meeting, 'mom_generated', False)
         })
     
     return {

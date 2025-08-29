@@ -24,6 +24,24 @@ class TaskAssigner:
         """Assign tasks from MOM to Microsoft Planner or send emails"""
         assigned_tasks = []
         
+        # Get or create meeting-specific bucket if Planner is configured
+        meeting_bucket_id = None
+        if self.default_plan_id:
+            try:
+                meeting_bucket_id = await self.graph_service.get_or_create_meeting_bucket(
+                    access_token=access_token,
+                    plan_id=self.default_plan_id,
+                    meeting_title=meeting_title
+                )
+                if meeting_bucket_id:
+                    logger.info(f"Using meeting-specific bucket: {meeting_bucket_id} for '{meeting_title}'")
+                else:
+                    logger.warning(f"Failed to create/find bucket for meeting '{meeting_title}', falling back to default bucket")
+                    meeting_bucket_id = self.default_bucket_id
+            except Exception as e:
+                logger.error(f"Error getting meeting bucket: {str(e)}, falling back to default bucket")
+                meeting_bucket_id = self.default_bucket_id
+        
         for action_item in action_items:
             task = action_item.get("task", "")
             assigned_to = action_item.get("assigned_to", "")
@@ -49,15 +67,30 @@ class TaskAssigner:
                 # Try to find user in Microsoft directory and create Planner task
                 user_info = await self._find_user_by_email(access_token, assigned_to)
                 
-                if user_info and self.default_plan_id and self.default_bucket_id:
-                    task_result = await self.graph_service.create_planner_task(
-                        access_token=access_token,
-                        plan_id=self.default_plan_id,
-                        bucket_id=self.default_bucket_id,
-                        task_title=f"[{meeting_title}] {task}",
-                        assigned_user_id=user_info["id"],
-                        due_date=due_date
-                    )
+                if user_info and self.default_plan_id and meeting_bucket_id:
+                    # Try creating task first (check if user is already a member)
+                    try:
+                        task_result = await self.graph_service.create_planner_task(
+                            access_token=access_token,
+                            plan_id=self.default_plan_id,
+                            bucket_id=meeting_bucket_id,
+                            task_title=f"[{meeting_title}] {task}",
+                            assigned_user_id=user_info["id"],
+                            due_date=due_date,
+                            auto_add_member=False  # Try without adding first
+                        )
+                    except Exception as e:
+                        # If task creation fails, try adding user to plan first
+                        logger.info(f"Task creation failed, attempting to add user to plan: {str(e)}")
+                        task_result = await self.graph_service.create_planner_task(
+                            access_token=access_token,
+                            plan_id=self.default_plan_id,
+                            bucket_id=meeting_bucket_id,
+                            task_title=f"[{meeting_title}] {task}",
+                            assigned_user_id=user_info["id"],
+                            due_date=due_date,
+                            auto_add_member=True  # Now try with automatic member addition
+                        )
                     
                     assigned_tasks.append({
                         "task": task,
@@ -66,6 +99,8 @@ class TaskAssigner:
                         "priority": priority,
                         "status": "assigned_to_planner",
                         "planner_task_id": task_result.get("id"),
+                        "planner_bucket_id": meeting_bucket_id,
+                        "meeting_bucket_created": meeting_bucket_id != self.default_bucket_id,
                         "assignee_name": user_info.get("displayName", assigned_to)
                     })
                     
